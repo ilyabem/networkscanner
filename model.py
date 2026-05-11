@@ -219,10 +219,26 @@ class NetworkTopology:
         return next(iter(self.devices.values()), None)
 
     def _assign_positions(self) -> None:
-        """Вычисляет начальные позиции узлов через spring layout NetworkX."""
+        """Вычисляет начальные позиции узлов.
+
+        Пробует spring_layout (требует numpy); если numpy не установлен —
+        раскладывает узлы по кругу (не требует внешних зависимостей).
+        """
         if not self.graph.nodes:
             return
-        pos = nx.spring_layout(self.graph, seed=42, k=2.0)
+
+        try:
+            pos = nx.spring_layout(self.graph, seed=42, k=2.0)
+        except Exception:
+            # Fallback: равномерно по кругу
+            import math
+            nodes = list(self.graph.nodes)
+            n = len(nodes)
+            pos = {}
+            for i, nid in enumerate(nodes):
+                angle = 2 * math.pi * i / max(n, 1)
+                pos[nid] = (math.cos(angle), math.sin(angle))
+
         # Масштабируем до размеров canvas (800×600 пикселей)
         for nid, (x, y) in pos.items():
             if nid in self.devices:
