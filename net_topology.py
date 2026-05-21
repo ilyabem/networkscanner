@@ -1,41 +1,26 @@
 #!/usr/bin/env python3
 """
-net_topology.py — главный файл сетевого сканера и редактора топологии.
+net_topology.py — точка входа.
 
-Установка зависимостей:
-    pip install -r requirements.txt
-    pip install numpy pysnmp
+Установка:
+    pip install -r requirements.txt && pip install numpy pysnmp
 
 Внешние утилиты:
-    - nmap (https://nmap.org/download.html) — требуется в системе
-    - На Linux/Mac: права root/sudo для ARP-сканирования
-    - На Windows: Npcap (https://npcap.com/) для работы Scapy
+    nmap  — https://nmap.org/download.html
+    Npcap — https://npcap.com/ (только Windows)
 
-Использование (одна подсеть):
-    python net_topology.py --subnet 192.168.1.0/24
-
-Использование (несколько подсетей):
+Использование:
+    python net_topology.py --subnet  192.168.1.0/24
     python net_topology.py --subnets 192.168.1.0/24 10.0.0.0/24
-    python net_topology.py --subnets 192.168.1.0/24,10.0.0.0/24
-
-Дополнительные флаги:
-    --community STRING   SNMP community string (по умолчанию: public)
-    --no-gui             Только CLI: таблица без графики
-    --max-hosts N        Ограничение числа хостов на подсеть
-    --load FILE          Загрузить сохранённую топологию из JSON
-    --timeout SEC        Таймаут ответа хоста (по умолчанию: 1.0)
-    --parallel           Сканировать подсети параллельно (ThreadPoolExecutor)
+    python net_topology.py --subnets 192.168.1.0/24,10.0.0.0/24 --parallel
+    python net_topology.py --load topology.json
+    python net_topology.py --subnet 192.168.1.0/24 --no-gui
 """
 
 import argparse
 import logging
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
-
-from scanner import NetworkScanner
-from analyzer import DeviceAnalyzer
-from model import NetworkTopology, Device
-from gui import run_gui
 
 logging.basicConfig(
     level=logging.INFO,
@@ -45,55 +30,37 @@ logging.basicConfig(
 logger = logging.getLogger("net_topology")
 
 
-# ─── Разбор аргументов ───────────────────────────────────────────────────────
+# ─── Аргументы ───────────────────────────────────────────────────────────────
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Сканер сети и редактор топологии (поддержка нескольких подсетей)",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-    )
+    p = argparse.ArgumentParser(description="Сканер и редактор топологии сети")
+    g = p.add_mutually_exclusive_group()
+    g.add_argument("--subnet",  metavar="CIDR",
+                   help="Одна подсеть, например 192.168.1.0/24")
+    g.add_argument("--subnets", nargs="+", metavar="CIDR",
+                   help="Несколько подсетей через пробел или запятую")
+    p.add_argument("--community", default="public",
+                   help="SNMP community string (по умолчанию: public)")
+    p.add_argument("--no-gui",    action="store_true",
+                   help="Только CLI-вывод, без GUI")
+    p.add_argument("--max-hosts", type=int, default=254,
+                   help="Макс. хостов на подсеть")
+    p.add_argument("--load",      metavar="FILE",
+                   help="Загрузить топологию из JSON")
+    p.add_argument("--timeout",   type=float, default=1.0,
+                   help="Таймаут ответа хоста (сек)")
+    p.add_argument("--parallel",  action="store_true",
+                   help="Параллельное сканирование подсетей")
+    return p.parse_args()
 
-    # Группа подсетей: --subnet (одна) или --subnets (несколько)
-    subnet_group = parser.add_mutually_exclusive_group()
-    subnet_group.add_argument(
-        "--subnet", metavar="CIDR",
-        help="Одна сканируемая подсеть, например 192.168.1.0/24",
-    )
-    subnet_group.add_argument(
-        "--subnets", nargs="+", metavar="CIDR",
-        help="Несколько подсетей через пробел или запятую: "
-             "--subnets 192.168.1.0/24 10.0.0.0/24  "
-             "или  --subnets 192.168.1.0/24,10.0.0.0/24",
-    )
-
-    parser.add_argument("--community", default="public", metavar="STRING",
-                        help="SNMP community string (по умолчанию: public)")
-    parser.add_argument("--no-gui", action="store_true",
-                        help="Только CLI: вывод таблицы без GUI")
-    parser.add_argument("--max-hosts", type=int, default=254, metavar="N",
-                        help="Макс. хостов на подсеть (защита от зависания)")
-    parser.add_argument("--load", metavar="FILE",
-                        help="Загрузить топологию из JSON-файла")
-    parser.add_argument("--timeout", type=float, default=1.0, metavar="SEC",
-                        help="Таймаут ответа хоста (по умолчанию: 1.0)")
-    parser.add_argument("--parallel", action="store_true",
-                        help="Сканировать подсети параллельно")
-    return parser.parse_args()
-
-
-# ─── Нормализация списка подсетей ────────────────────────────────────────────
 
 def resolve_subnets(args: argparse.Namespace) -> list[str]:
-    """
-    Собирает список подсетей из аргументов.
-    Поддерживает: --subnet X, --subnets X Y, --subnets X,Y,Z
-    """
+    """Собирает список подсетей из --subnet / --subnets."""
     if args.subnet:
         return [args.subnet]
     if args.subnets:
         result = []
         for item in args.subnets:
-            # Разбиваем по запятой на случай "192.168.1.0/24,10.0.0.0/24"
             for part in item.split(","):
                 part = part.strip()
                 if part:
@@ -103,30 +70,25 @@ def resolve_subnets(args: argparse.Namespace) -> list[str]:
 
 
 # ─── Сканирование одной подсети ───────────────────────────────────────────────
+# Вынесено в отдельную функцию, импортируется gui.py через lazy-import
+# внутри ScanWorker.run() — чтобы избежать циклического импорта.
 
-def scan_subnet(
-    subnet: str,
-    community: str,
-    timeout: float,
-    max_hosts: int,
-) -> tuple[str, list[Device], dict]:
+def scan_subnet(subnet: str, community: str,
+                timeout: float, max_hosts: int):
     """
-    Сканирует одну подсеть и возвращает кортеж:
-        (subnet, hosts_list, arp_table)
-
-    Используется как для последовательного, так и для параллельного запуска.
+    Сканирует одну подсеть.
+    Возвращает (subnet, hosts, arp_table).
+    Импортирует scanner/analyzer здесь, не на уровне модуля.
     """
-    logger.info("▶ Сканирование подсети %s", subnet)
-    scanner = NetworkScanner(
-        subnet=subnet,
-        timeout=timeout,
-        max_hosts=max_hosts,
-        snmp_community=community,
-    )
-    hosts = scanner.scan()
-    logger.info("◀ Подсеть %s: найдено %d хостов", subnet, len(hosts))
+    from scanner  import NetworkScanner
+    from analyzer import DeviceAnalyzer
 
-    # Обогащаем каждый хост: тип устройства, SNMP, vendor
+    logger.info("▶ %s", subnet)
+    scanner = NetworkScanner(subnet=subnet, timeout=timeout,
+                             max_hosts=max_hosts, snmp_community=community)
+    hosts   = scanner.scan()
+    logger.info("◀ %s: %d хостов", subnet, len(hosts))
+
     analyzer = DeviceAnalyzer(snmp_community=community)
     for host in hosts:
         analyzer.enrich(host)
@@ -134,140 +96,103 @@ def scan_subnet(
     return subnet, hosts, scanner.get_arp_table()
 
 
-# ─── CLI-вывод таблицы ───────────────────────────────────────────────────────
+# ─── CLI-таблица ─────────────────────────────────────────────────────────────
 
-def print_cli_table(topology: NetworkTopology) -> None:
+def print_cli_table(topology) -> None:
     """
-    Выводит найденные устройства и связи в текстовом виде.
-    Мультиинтерфейсные устройства помечены звёздочкой (*).
+    Печатает таблицу устройств.
+    Мультиинтерфейсные помечены *.
     """
-    print("\n" + "=" * 80)
-    print("  ОБНАРУЖЕННЫЕ УСТРОЙСТВА")
-    print("  * = мультиинтерфейсное устройство (несколько IP/подсетей)")
-    print("=" * 80)
-    header = f"{'*':<2} {'IP':<18} {'MAC':<19} {'Тип':<12} {'Производитель':<22} {'Имя хоста'}"
-    print(header)
-    print("-" * 80)
-
+    from model import DEVICE_TYPE_LABELS
+    print("\n" + "=" * 84)
+    print("  ОБНАРУЖЕННЫЕ УСТРОЙСТВА  (* = мультиинтерфейсное)")
+    print("=" * 84)
+    print(f"{'*':<2} {'IP':<18} {'MAC':<19} {'Тип':<18} {'Производитель':<22} Имя")
+    print("-" * 84)
     for dev in topology.devices.values():
-        mark = "*" if dev.is_multihomed else " "
-        print(
-            f"{mark:<2} {dev.ip:<18} {dev.mac or '—':<19} "
-            f"{dev.device_type:<12} {dev.vendor or '—':<22} "
-            f"{dev.hostname or '—'}"
-        )
-        # Для мультиинтерфейсных выводим все интерфейсы
+        mark  = "*" if dev.is_multihomed else " "
+        label = DEVICE_TYPE_LABELS.get(dev.device_type, dev.device_type)
+        print(f"{mark:<2} {dev.ip:<18} {dev.mac or '—':<19} "
+              f"{label:<18} {dev.vendor or '—':<22} {dev.hostname or '—'}")
         if dev.is_multihomed:
             for iface in dev.interfaces:
                 if iface.ip != dev.ip:
-                    iname = f" ({iface.iface_name})" if iface.iface_name else ""
-                    sname = f" [{iface.subnet}]"     if iface.subnet     else ""
-                    print(f"   ↳ {iface.ip}{iname}{sname}")
+                    sn = f" [{iface.subnet}]" if iface.subnet else ""
+                    nm = f" ({iface.iface_name})" if iface.iface_name else ""
+                    print(f"   ↳ {iface.ip}{nm}{sn}")
 
-    print("\n" + "=" * 80)
+    print("\n" + "=" * 84)
     print("  СВЯЗИ")
-    print("=" * 80)
+    print("=" * 84)
     if topology.links:
         for src, dst, attrs in topology.links:
-            src_dev = topology.devices.get(src)
-            dst_dev = topology.devices.get(dst)
-            src_ip  = src_dev.ip if src_dev else src
-            dst_ip  = dst_dev.ip if dst_dev else dst
-            label   = attrs.get("label", "")
-            print(f"  {src_ip:<20}  ──  {dst_ip:<20}  [{label}]")
+            sd = topology.devices.get(src)
+            dd = topology.devices.get(dst)
+            print(f"  {(sd.ip if sd else src):<20} ── "
+                  f"{(dd.ip if dd else dst):<20} [{attrs.get('label','')}]")
     else:
         print("  Связи не обнаружены")
     print()
 
 
-# ─── Точка входа ─────────────────────────────────────────────────────────────
+# ─── main ─────────────────────────────────────────────────────────────────────
 
 def main() -> None:
-    args = parse_args()
+    args     = parse_args()
+    # Импортируем модель здесь — gui импортируется только если нужен
+    from model import NetworkTopology
     topology = NetworkTopology()
 
-    # ── Режим загрузки из файла ───────────────────────────────────────────────
     if args.load:
-        logger.info("Загрузка топологии из %s", args.load)
+        logger.info("Загрузка из %s", args.load)
         topology.load_json(args.load)
 
     else:
         subnets = resolve_subnets(args)
 
-        if not subnets:
-            # Ни подсеть, ни файл не указаны → запуск GUI с пустой топологией
-            logger.info("Подсети не указаны — запуск с пустой топологией")
-
-        elif len(subnets) == 1:
-            # ── Одна подсеть (обратная совместимость) ────────────────────────
-            subnet = subnets[0]
-            logger.info("Сканирование подсети %s", subnet)
-            try:
-                _, hosts, arp_table = scan_subnet(
-                    subnet, args.community, args.timeout, args.max_hosts
-                )
-            except PermissionError as exc:
-                logger.error("Недостаточно прав (нужен root/администратор): %s", exc)
-                sys.exit(1)
-            except Exception as exc:
-                logger.error("Ошибка сканирования: %s", exc)
-                sys.exit(1)
-
-            if not hosts:
-                logger.warning("Живые хосты не найдены в %s", subnet)
-
-            topology.build_from_hosts(hosts, arp_table, subnet=subnet)
-
-        else:
-            # ── Несколько подсетей ────────────────────────────────────────────
-            logger.info("Сканирование %d подсетей: %s", len(subnets), subnets)
-            subnet_results = []
-
-            if args.parallel:
-                # Параллельное сканирование через ThreadPoolExecutor
-                logger.info("Режим: параллельное сканирование")
-                with ThreadPoolExecutor(max_workers=len(subnets)) as executor:
+        if subnets:
+            results = []
+            if len(subnets) == 1 or not args.parallel:
+                for s in subnets:
+                    try:
+                        results.append(scan_subnet(
+                            s, args.community, args.timeout, args.max_hosts))
+                    except PermissionError as e:
+                        logger.error("Нет прав для %s: %s", s, e)
+                    except Exception as e:
+                        logger.error("Ошибка %s: %s", s, e)
+            else:
+                with ThreadPoolExecutor(max_workers=len(subnets)) as ex:
                     futures = {
-                        executor.submit(
-                            scan_subnet, s, args.community, args.timeout, args.max_hosts
-                        ): s
+                        ex.submit(scan_subnet, s, args.community,
+                                  args.timeout, args.max_hosts): s
                         for s in subnets
                     }
-                    for future in as_completed(futures):
-                        s = futures[future]
+                    for fut in as_completed(futures):
                         try:
-                            subnet_results.append(future.result())
-                        except PermissionError as exc:
-                            logger.error("Нет прав для %s: %s", s, exc)
-                        except Exception as exc:
-                            logger.error("Ошибка сканирования %s: %s", s, exc)
-            else:
-                # Последовательное сканирование
-                logger.info("Режим: последовательное сканирование")
-                for subnet in subnets:
-                    try:
-                        subnet_results.append(
-                            scan_subnet(subnet, args.community, args.timeout, args.max_hosts)
-                        )
-                    except PermissionError as exc:
-                        logger.error("Нет прав для %s: %s", subnet, exc)
-                    except Exception as exc:
-                        logger.error("Ошибка сканирования %s: %s", subnet, exc)
+                            results.append(fut.result())
+                        except Exception as e:
+                            logger.error("Ошибка %s: %s", futures[fut], e)
 
-            if not subnet_results:
-                logger.error("Ни одна подсеть не была успешно просканирована")
+            if not results:
+                logger.error("Ни одна подсеть не просканирована")
                 sys.exit(1)
 
-            # Строим топологию с объединением по MAC
-            topology.build_from_multi_subnet(subnet_results)
+            if len(results) == 1:
+                s, hosts, arp = results[0]
+                topology.build_from_hosts(hosts, arp, subnet=s)
+            else:
+                topology.build_from_multi_subnet(results)
+        else:
+            logger.info("Подсети не указаны — пустая топология")
 
-    # ── CLI-режим ─────────────────────────────────────────────────────────────
     if args.no_gui:
         print_cli_table(topology)
         return
 
-    # ── GUI ───────────────────────────────────────────────────────────────────
-    logger.info("Запуск графического интерфейса")
+    # GUI импортируется только здесь — нет циклического импорта
+    from gui import run_gui
+    logger.info("Запуск GUI")
     run_gui(topology)
 
 
