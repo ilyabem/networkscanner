@@ -3,12 +3,20 @@ analyzer.py — модуль анализа и классификации уст
 
 Определяет тип устройства по комбинации признаков:
   1. SNMP sysDescr / sysServices (если доступен порт 161)
-  2. Открытые порты (эвристика)
-  3. TTL из ICMP-ответа (косвенный признак ОС)
+  2. Открытые порты (расширенная эвристика)
+  3. TTL из ICMP-ответа
   4. OUI MAC-адреса (производитель)
-  5. Ключевые слова в hostname
+  5. Ключевые слова в hostname / sysDescr
 
-Если определить тип не удалось — устанавливает "unknown".
+ДОРАБОТКА — расширенные типы и паттерны:
+  Теперь различаем не просто «endpoint», а:
+    windows_endpoint  — ПК/ноутбук под Windows
+    linux_endpoint    — ПК/ноутбук под Linux/macOS
+    windows_server    — сервер под Windows Server
+    linux_server      — сервер под Linux
+    printer           — сетевой принтер
+  Сетевое оборудование делится как прежде: router / switch / bridge / firewall.
+  Если тип не определён — unknown.
 """
 
 from __future__ import annotations
@@ -25,72 +33,170 @@ logger = logging.getLogger("analyzer")
 # ─── Попытка импорта pysnmp ──────────────────────────────────────────────────
 try:
     from pysnmp.hlapi import (  # type: ignore
-        CommunityData,
-        ContextData,
-        ObjectIdentity,
-        ObjectType,
-        SnmpEngine,
-        UdpTransportTarget,
-        getCmd,
+        CommunityData, ContextData, ObjectIdentity,
+        ObjectType, SnmpEngine, UdpTransportTarget, getCmd,
     )
     SNMP_AVAILABLE = True
 except ImportError:
     SNMP_AVAILABLE = False
     logger.warning("pysnmp не установлен. SNMP-опрос недоступен.")
 
-# ─── OID для SNMP-запросов ───────────────────────────────────────────────────
-OID_SYS_DESCR    = "1.3.6.1.2.1.1.1.0"   # sysDescr — описание системы
-OID_SYS_SERVICES = "1.3.6.1.2.1.1.7.0"   # sysServices — битовая маска сервисов
-OID_SYS_NAME     = "1.3.6.1.2.1.1.5.0"   # sysName — имя устройства
+OID_SYS_DESCR    = "1.3.6.1.2.1.1.1.0"
+OID_SYS_SERVICES = "1.3.6.1.2.1.1.7.0"
+OID_SYS_NAME     = "1.3.6.1.2.1.1.5.0"
 
-# ─── Эвристики по портам ─────────────────────────────────────────────────────
-# Порт → набор возможных типов (от более специфичного к менее)
-PORT_TYPE_MAP: dict[int, list[str]] = {
-    22:   ["server", "router"],    # SSH: сервер или сетевое оборудование
-    23:   ["router", "switch"],    # Telnet: чаще сетевое оборудование
-    25:   ["server"],              # SMTP: почтовый сервер
-    53:   ["server", "router"],    # DNS
-    67:   ["router", "server"],    # DHCP
-    80:   ["server"],              # HTTP
-    161:  ["router", "switch"],    # SNMP: сетевое оборудование
-    443:  ["server"],              # HTTPS
-    445:  ["server", "endpoint"],  # SMB: Windows-файловый сервер или ПК
-    3389: ["endpoint", "server"],  # RDP: рабочий стол (Windows)
-    8080: ["server"],
-    8443: ["server"],
+# ─── Расширенный список типов ────────────────────────────────────────────────
+# Новые типы для точной классификации конечных точек
+EXTENDED_DEVICE_TYPES = [
+    "router",
+    "switch",
+    "bridge",
+    "firewall",
+    "windows_server",   # Windows Server 2012/2016/2019/2022
+    "linux_server",     # Linux-сервер (Ubuntu Server, CentOS, Debian...)
+    "server",           # сервер (ОС не определена)
+    "windows_endpoint", # ПК / ноутбук под Windows
+    "linux_endpoint",   # ПК / ноутбук под Linux или macOS
+    "printer",          # сетевой принтер / МФУ
+    "endpoint",         # конечная точка (ОС не определена)
+    "unknown",
+]
+
+# ─── Паттерны по ключевым словам ────────────────────────────────────────────
+# Порядок важен: более специфичные паттерны — раньше.
+# Каждая запись: (список ключевых слов, тип, вес)
+KEYWORD_PATTERNS: list[tuple[list[str], str, float]] = [
+    # ── Сетевое оборудование ────────────────────────────────────────────────
+    (["pfsense", "opnsense", "fortigate", "fortifw", "checkpoint",
+      "watchguard", "sophos", "junos srx", "palo alto", "asa",
+      "cisco asa", "netscreen"],                          "firewall",         10),
+    (["cisco ios", "cisco nx-os", "cisco ios-xe", "ios software",
+      "junos", "routeros", "mikrotik", "edgeos", "vyos",
+      "openwrt", "dd-wrt", "маршрутизатор"],              "router",           10),
+    (["catalyst", "procurve", "aruba", "hp switch", "netgear gs",
+      "netgear fs", "d-link switch", "tp-link switch",
+      "juniper ex", "cisco sg", "cisco sf",
+      "коммутатор", "switch software"],                   "switch",           10),
+    (["bridge", "бридж"],                                 "bridge",           8),
+
+    # ── Windows Server ───────────────────────────────────────────────────────
+    (["windows server 2022", "windows server 2019",
+      "windows server 2016", "windows server 2012",
+      "windows server 2008", "microsoft windows server"],  "windows_server",   12),
+
+    # ── Linux Server (без desktop-окружения, серверные дистрибутивы) ─────────
+    (["ubuntu server", "ubuntu 20.04 lts", "ubuntu 22.04 lts",
+      "ubuntu 24.04 lts", "centos linux", "red hat enterprise",
+      "rhel", "almalinux", "rocky linux", "oracle linux",
+      "debian gnu/linux", "debian 11", "debian 12",
+      "debian 10", "suse linux enterprise", "sles",
+      "freebsd", "proxmox", "esxi", "vmware esxi",
+      "linux server"],                                     "linux_server",     12),
+
+    # ── macOS / Linux Desktop ────────────────────────────────────────────────
+    (["darwin", "macos", "mac os x", "apple mac"],         "linux_endpoint",   9),
+    (["ubuntu desktop", "fedora", "arch linux", "manjaro",
+      "pop!_os", "elementary os", "linux mint", "kubuntu",
+      "xubuntu", "lubuntu", "zorin"],                      "linux_endpoint",   9),
+
+    # ── Windows Desktop ──────────────────────────────────────────────────────
+    (["windows 11", "windows 10", "windows 8", "windows 7",
+      "windows vista", "windows xp", "microsoft windows 1",
+      "workstation"],                                       "windows_endpoint", 9),
+
+    # ── Принтеры и МФУ ───────────────────────────────────────────────────────
+    (["printer", "принтер", "laserjet", "officejet", "mfp",
+      "мфу", "ricoh", "kyocera", "xerox", "canon printer",
+      "epson", "brother mfc", "hp color"],                 "printer",          11),
+
+    # ── Общий Linux/Unix (если не попало выше) ───────────────────────────────
+    (["linux", "unix", "nginx", "apache", "postfix",
+      "openssh", "snmpd"],                                 "linux_server",     5),
+
+    # ── Общий Windows (если не попало выше) ──────────────────────────────────
+    (["windows", "microsoft", "msrpc", "netbios"],         "windows_endpoint", 4),
+]
+
+# ─── Эвристика по портам ────────────────────────────────────────────────────
+# port → [(тип, вес), ...]  — взвешенное голосование
+PORT_WEIGHTS: dict[int, list[tuple[str, float]]] = {
+    # Сетевое оборудование
+    23:   [("router", 4), ("switch", 3)],          # Telnet
+    161:  [("router", 5), ("switch", 5)],           # SNMP
+    179:  [("router", 6)],                          # BGP
+    520:  [("router", 4)],                          # RIP
+    # Серверы
+    21:   [("linux_server", 3), ("server", 2)],     # FTP
+    22:   [("linux_server", 3), ("router", 2)],     # SSH
+    25:   [("linux_server", 5), ("windows_server", 4)],  # SMTP
+    53:   [("linux_server", 3), ("router", 2)],     # DNS
+    67:   [("router", 3), ("linux_server", 2)],     # DHCP
+    80:   [("linux_server", 3), ("windows_server", 3), ("printer", 2)],
+    110:  [("linux_server", 4), ("windows_server", 4)],  # POP3
+    143:  [("linux_server", 4), ("windows_server", 4)],  # IMAP
+    389:  [("windows_server", 5), ("linux_server", 4)],  # LDAP
+    443:  [("linux_server", 3), ("windows_server", 3)],  # HTTPS
+    445:  [("windows_server", 4), ("windows_endpoint", 3)],  # SMB
+    636:  [("windows_server", 4), ("linux_server", 4)],  # LDAPS
+    993:  [("linux_server", 4), ("windows_server", 3)],  # IMAPS
+    995:  [("linux_server", 4), ("windows_server", 3)],  # POP3S
+    1433: [("windows_server", 6)],                  # MSSQL
+    1521: [("linux_server", 5), ("windows_server", 4)],  # Oracle
+    3306: [("linux_server", 6), ("windows_server", 3)],  # MySQL
+    5432: [("linux_server", 6)],                    # PostgreSQL
+    5985: [("windows_server", 5), ("windows_endpoint", 3)],  # WinRM HTTP
+    5986: [("windows_server", 5)],                  # WinRM HTTPS
+    6379: [("linux_server", 5)],                    # Redis
+    8080: [("linux_server", 3), ("windows_server", 3)],
+    8443: [("linux_server", 3), ("windows_server", 3)],
+    27017:[("linux_server", 5)],                    # MongoDB
+    # Windows endpoint / RDP
+    3389: [("windows_endpoint", 5), ("windows_server", 4)],  # RDP
+    # Принтеры
+    9100: [("printer", 8)],                         # JetDirect (RAW print)
+    515:  [("printer", 7)],                         # LPD
+    631:  [("printer", 6)],                         # IPP (CUPS)
 }
 
-# Ключевые слова для определения типа по sysDescr / hostname
-KEYWORD_MAP: list[tuple[list[str], str]] = [
-    (["cisco", "ios", "router", "маршрутизатор"],    "router"),
-    (["mikrotik", "routeros"],                        "router"),
-    (["juniper", "junos"],                            "router"),
-    (["pfsense", "opnsense", "firewall", "fortigate"], "firewall"),
-    (["switch", "коммутатор", "catalyst", "procurve", "aruba"], "switch"),
-    (["bridge", "бридж"],                             "bridge"),
-    (["linux", "ubuntu", "debian", "centos", "freebsd",
-      "windows server", "nginx", "apache", "postfix"], "server"),
-    (["windows", "printer", "принтер"],               "endpoint"),
+# Порты-«убийцы» — если открыт, тип почти точно определён
+DEFINITIVE_PORTS: dict[int, str] = {
+    9100: "printer",
+    515:  "printer",
+    1433: "windows_server",
+    5985: "windows_server",
+}
+
+# ─── TTL → тип ───────────────────────────────────────────────────────────────
+# TTL 64  → Linux/macOS (endpoint или server)
+# TTL 128 → Windows
+# TTL 255 → сетевое оборудование Cisco/HP
+TTL_HINTS: list[tuple[range, str, float]] = [
+    (range(63, 66),  "linux_server",     1.5),  # 64 — Linux default
+    (range(127, 130),"windows_endpoint", 1.5),  # 128 — Windows default
+    (range(250, 256), "router",          2.0),  # 255 — Cisco/HP
 ]
 
-# Эвристика по TTL (Linux ≈ 64, Windows ≈ 128, сетевое оборудование ≈ 255)
-TTL_TYPE_HINTS: list[tuple[range, str]] = [
-    (range(60, 70),  "server"),      # Linux/Unix
-    (range(120, 135), "endpoint"),   # Windows
-    (range(250, 256), "router"),     # Cisco/HP networking
+# ─── OUI производителя → тип ─────────────────────────────────────────────────
+VENDOR_WEIGHTS: list[tuple[list[str], str, float]] = [
+    # Сетевое оборудование
+    (["cisco",  "juniper", "mikrotik", "ubiquiti", "aruba",
+      "zyxel",  "d-link",  "tp-link",  "netgear",  "zyxel",
+      "extreme networks", "brocade", "allied telesis"],    "router",           4),
+    (["hewlett packard enterprise", "hp enterprise",
+      "fortinet", "watchguard", "palo alto networks",
+      "checkpoint"],                                       "firewall",         4),
+    # Серверы и ПК
+    (["dell", "supermicro", "intel corporate",
+      "ibm", "lenovo", "hewlett-packard"],                 "linux_server",     2),
+    (["apple"],                                            "linux_endpoint",   3),
+    (["samsung", "lg electronics", "huawei"],              "windows_endpoint", 2),
+    # Принтеры
+    (["seiko epson", "canon", "ricoh", "kyocera",
+      "xerox", "lexmark", "brother industries"],           "printer",          5),
+    # VMware / виртуалки → скорее всего сервер
+    (["vmware", "oracle virtualbox", "parallels",
+      "xensource"],                                        "linux_server",     3),
 ]
-
-# Ключевые слова в OUI-производителе
-VENDOR_MAP: list[tuple[list[str], str]] = [
-    (["cisco", "juniper", "mikrotik", "ubiquiti", "aruba", "zyxel", "d-link"], "router"),
-    (["hewlett", "hp", "netgear", "tp-link", "tplink"], "switch"),
-    (["fortinet", "watchguard", "palo alto", "checkpoint"], "firewall"),
-    (["dell", "hp inc", "lenovo", "apple", "samsung", "intel"], "endpoint"),
-    (["vmware", "oracle", "supermicro"], "server"),
-]
-
-# Порты, которые почти гарантируют «это сервер»
-SERVER_DEFINITIVE_PORTS = {25, 110, 143, 587, 993, 995, 3306, 5432, 6379, 27017}
 
 
 class DeviceAnalyzer:
@@ -98,214 +204,181 @@ class DeviceAnalyzer:
 
     def __init__(self, snmp_community: str = "public", snmp_timeout: float = 1.0) -> None:
         self.snmp_community = snmp_community
-        self.snmp_timeout = snmp_timeout
-
-    # ─── Главный метод обогащения ────────────────────────────────────────────
+        self.snmp_timeout   = snmp_timeout
 
     def enrich(self, device: "Device") -> None:
         """
-        Запускает все доступные методы определения типа устройства
-        и выставляет device.device_type.
+        Запускает все доступные методы определения типа.
+        Использует взвешенное голосование — побеждает тип с наибольшей суммой весов.
         """
-        scores: dict[str, float] = {}  # тип → вес
+        scores: dict[str, float] = {}
 
-        # 1. SNMP (наиболее надёжный источник)
+        def vote(dtype: str, weight: float) -> None:
+            scores[dtype] = scores.get(dtype, 0) + weight
+
+        # 1. SNMP (самый надёжный источник, если доступен)
         if SNMP_AVAILABLE and 161 in device.open_ports:
-            snmp_type = self._classify_by_snmp(device)
-            if snmp_type:
-                scores[snmp_type] = scores.get(snmp_type, 0) + 10
+            snmp_result = self._query_snmp(device)
+            if snmp_result:
+                dtype, weight, sys_name = snmp_result
+                vote(dtype, weight)
+                if sys_name and not device.hostname:
+                    device.hostname = sys_name
 
-        # 2. Открытые порты
-        port_type = self._classify_by_ports(device.open_ports)
-        if port_type:
-            scores[port_type] = scores.get(port_type, 0) + 5
-
-        # 3. TTL
-        if device.ttl is not None:
-            ttl_type = self._classify_by_ttl(device.ttl)
-            if ttl_type:
-                scores[ttl_type] = scores.get(ttl_type, 0) + 2
-
-        # 4. Производитель (OUI)
-        if device.vendor:
-            vendor_type = self._classify_by_vendor(device.vendor)
-            if vendor_type:
-                scores[vendor_type] = scores.get(vendor_type, 0) + 3
-
-        # 5. Hostname / имя
+        # 2. Ключевые слова в hostname
         if device.hostname:
-            name_type = self._classify_by_keywords(device.hostname)
-            if name_type:
-                scores[name_type] = scores.get(name_type, 0) + 4
+            self._keywords_vote(device.hostname, scores)
 
-        # Выбираем тип с максимальным весом
+        # 3. Открытые порты
+        self._ports_vote(device.open_ports, scores)
+
+        # 4. TTL
+        if device.ttl is not None:
+            for ttl_range, dtype, w in TTL_HINTS:
+                if device.ttl in ttl_range:
+                    vote(dtype, w)
+
+        # 5. Производитель OUI
+        if device.vendor:
+            vendor_lower = device.vendor.lower()
+            for keywords, dtype, w in VENDOR_WEIGHTS:
+                if any(kw in vendor_lower for kw in keywords):
+                    vote(dtype, w)
+                    break
+
+        # Выбираем победителя
         if scores:
             device.device_type = max(scores, key=lambda k: scores[k])
         else:
             device.device_type = "unknown"
 
         logger.info(
-            "%-18s → %-10s (scores: %s)",
+            "%-18s → %-18s  scores=%s",
             device.ip,
             device.device_type,
-            {k: round(v, 1) for k, v in sorted(scores.items(), key=lambda x: -x[1])},
+            {k: round(v, 1) for k, v in
+             sorted(scores.items(), key=lambda x: -x[1])[:4]},
         )
 
-    # ─── SNMP ────────────────────────────────────────────────────────────────
+    # ─── SNMP ───────────────────────────────────────────────────────────────
 
-    def _classify_by_snmp(self, device: "Device") -> str | None:
+    def _query_snmp(self, device: "Device") -> tuple[str, float, str] | None:
         """
-        Опрашивает устройство по SNMP v1/v2c.
-        Читает sysDescr и sysServices, классифицирует по ключевым словам и битам.
+        SNMP GET sysDescr + sysServices + sysName.
+        Возвращает (тип, вес, имя_хоста) или None при ошибке.
         """
         try:
-            result = self._snmp_get(device.ip, [OID_SYS_DESCR, OID_SYS_SERVICES, OID_SYS_NAME])
-        except Exception as exc:  # noqa: BLE001
-            logger.debug("SNMP ошибка %s: %s", device.ip, exc)
+            result = self._snmp_get(device.ip,
+                                    [OID_SYS_DESCR, OID_SYS_SERVICES, OID_SYS_NAME])
+        except Exception as exc:
+            logger.debug("SNMP %s: %s", device.ip, exc)
             return None
 
+        device.snmp_info = result
         sys_descr    = result.get(OID_SYS_DESCR, "").lower()
         sys_services = result.get(OID_SYS_SERVICES, "0")
         sys_name     = result.get(OID_SYS_NAME, "")
 
-        device.snmp_info = result
-        if sys_name and not device.hostname:
-            device.hostname = sys_name
-
-        # sysServices — битовая маска RFC 1213:
-        # bit 0 (1): physical (L1), bit 1 (2): datalink/subnet (L2)
-        # bit 2 (4): internet (L3), bit 3 (8): end-to-end (L4), bit 6 (64): applications
-        try:
-            svc = int(sys_services)
-        except ValueError:
-            svc = 0
-
-        # Приоритет: L3 (маршрутизатор), L2 (коммутатор), L7 (сервер)
-        if svc & 4 and not (svc & 64):
-            # Routing включён, приложений нет — скорее всего роутер
-            device_type = "router"
-        elif svc & 2 and not (svc & 4):
-            # Только L2 — коммутатор
-            device_type = "switch"
-        elif svc & 64:
-            # Приложения (L7) — сервер или конечная точка
-            device_type = "server"
-        else:
-            device_type = None
-
-        # Уточнение по sysDescr (ключевые слова важнее битовой маски)
-        kw_type = self._classify_by_keywords(sys_descr)
+        # Сначала пробуем ключевые слова в sysDescr (точнее sysServices)
+        kw_type = self._match_keywords(sys_descr)
         if kw_type:
-            device_type = kw_type
+            return kw_type, 10.0, sys_name
 
-        return device_type
+        # Fallback: sysServices битовая маска RFC 1213
+        dtype = parse_snmp_services(sys_services)
+        if dtype:
+            return dtype, 7.0, sys_name
+
+        return None
 
     def _snmp_get(self, ip: str, oids: list[str]) -> dict[str, str]:
-        """
-        Выполняет SNMP GET-запрос и возвращает словарь {oid: value}.
-        Использует pysnmp v4 (hlapi).
-        """
         result: dict[str, str] = {}
-        engine = SnmpEngine()
-        community = CommunityData(self.snmp_community, mpModel=1)  # v2c
-        transport = UdpTransportTarget(
-            (ip, 161),
-            timeout=self.snmp_timeout,
-            retries=1,
-        )
-        context = ContextData()
-
+        engine    = SnmpEngine()
+        community = CommunityData(self.snmp_community, mpModel=1)
+        transport = UdpTransportTarget((ip, 161),
+                                       timeout=self.snmp_timeout, retries=1)
+        context   = ContextData()
         for oid in oids:
-            obj_type = ObjectType(ObjectIdentity(oid))
-            error_indication, error_status, _, var_binds = next(
-                getCmd(engine, community, transport, context, obj_type)
+            error_ind, error_st, _, var_binds = next(
+                getCmd(engine, community, transport, context,
+                       ObjectType(ObjectIdentity(oid)))
             )
-            if error_indication or error_status:
-                continue
-            for var_bind in var_binds:
-                result[oid] = str(var_bind[1])
-
+            if not error_ind and not error_st:
+                for vb in var_binds:
+                    result[oid] = str(vb[1])
         return result
 
-    # ─── Эвристика по портам ────────────────────────────────────────────────
+    # ─── Ключевые слова ─────────────────────────────────────────────────────
 
     @staticmethod
-    def _classify_by_ports(open_ports: list[int]) -> str | None:
-        """Определяет тип по открытым портам с взвешенным голосованием."""
-        if not open_ports:
-            return None
-
-        port_set = set(open_ports)
-
-        # Порты, однозначно указывающие на сервер
-        if port_set & SERVER_DEFINITIVE_PORTS:
-            return "server"
-
-        # Голосование: счётчик для каждого возможного типа
-        votes: dict[str, int] = {}
-        for port in port_set:
-            for candidate_type in PORT_TYPE_MAP.get(port, []):
-                votes[candidate_type] = votes.get(candidate_type, 0) + 1
-
-        if not votes:
-            return None
-
-        # Тип с наибольшим числом голосов
-        return max(votes, key=lambda k: votes[k])
-
-    # ─── Эвристика по TTL ────────────────────────────────────────────────────
-
-    @staticmethod
-    def _classify_by_ttl(ttl: int) -> str | None:
-        for ttl_range, device_type in TTL_TYPE_HINTS:
-            if ttl in ttl_range:
-                return device_type
-        return None
-
-    # ─── Эвристика по производителю ─────────────────────────────────────────
-
-    @staticmethod
-    def _classify_by_vendor(vendor: str) -> str | None:
-        vendor_lower = vendor.lower()
-        for keywords, device_type in VENDOR_MAP:
-            if any(kw in vendor_lower for kw in keywords):
-                return device_type
-        return None
-
-    # ─── Ключевые слова ──────────────────────────────────────────────────────
-
-    @staticmethod
-    def _classify_by_keywords(text: str) -> str | None:
+    def _match_keywords(text: str) -> str | None:
+        """Возвращает тип по первому совпадению в KEYWORD_PATTERNS."""
         text_lower = text.lower()
-        for keywords, device_type in KEYWORD_MAP:
+        best_type: str | None = None
+        best_weight: float    = 0
+        for keywords, dtype, weight in KEYWORD_PATTERNS:
             if any(kw in text_lower for kw in keywords):
-                return device_type
-        return None
+                if weight > best_weight:
+                    best_type   = dtype
+                    best_weight = weight
+        return best_type
+
+    @staticmethod
+    def _keywords_vote(text: str, scores: dict[str, float]) -> None:
+        """Добавляет веса в scores по всем совпадениям ключевых слов."""
+        text_lower = text.lower()
+        for keywords, dtype, weight in KEYWORD_PATTERNS:
+            if any(kw in text_lower for kw in keywords):
+                scores[dtype] = scores.get(dtype, 0) + weight
+
+    # ─── Порты ──────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _ports_vote(open_ports: list[int], scores: dict[str, float]) -> None:
+        port_set = set(open_ports)
+        # Дефинитивные порты — очень высокий вес
+        for port, dtype in DEFINITIVE_PORTS.items():
+            if port in port_set:
+                scores[dtype] = scores.get(dtype, 0) + 15
+                return  # дефинитивный порт — дальше не смотрим
+        # Взвешенное голосование
+        for port in port_set:
+            for dtype, weight in PORT_WEIGHTS.get(port, []):
+                scores[dtype] = scores.get(dtype, 0) + weight
 
 
-# ─── Публичные вспомогательные функции (используются в тестах) ───────────────
+# ─── Публичные функции для тестов ────────────────────────────────────────────
 
 def classify_by_ports(open_ports: list[int]) -> str | None:
-    """Обёртка для тестирования."""
-    return DeviceAnalyzer._classify_by_ports(open_ports)
+    """Определяет тип по портам. Публичная обёртка для тестов."""
+    scores: dict[str, float] = {}
+    DeviceAnalyzer._ports_vote(open_ports, scores)
+    return max(scores, key=lambda k: scores[k]) if scores else None
 
 
 def parse_snmp_services(sys_services_value: str) -> str | None:
     """
-    Парсит значение sysServices (строка с числом) и возвращает
-    предполагаемый тип устройства.
+    Парсит sysServices RFC 1213 и возвращает тип устройства.
+    Публичная функция, используется в тестах.
 
-    Используется в unit-тестах напрямую.
+    Битовая маска:
+      bit1 (2)  — datalink/L2 → switch
+      bit2 (4)  — internet/L3 routing → router
+      bit6 (64) — application/L7 → server
     """
     try:
         svc = int(sys_services_value)
     except (ValueError, TypeError):
         return None
-
     if svc & 4 and not (svc & 64):
         return "router"
     if svc & 2 and not (svc & 4) and not (svc & 64):
         return "switch"
     if svc & 64:
-        return "server"
+        return "linux_server"   # уточнённый тип вместо просто "server"
     return None
+
+
+def classify_by_keywords(text: str) -> str | None:
+    """Публичная обёртка для тестов."""
+    return DeviceAnalyzer._match_keywords(text)
